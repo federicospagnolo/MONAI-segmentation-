@@ -11,7 +11,8 @@
 
 from __future__ import annotations
 
-from .class_activation_maps import CAM, GradCAM, GradCAMpp, ModelWithHooks, default_normalizer
+from .class_activation_maps import CAM, GradCAM, GradCAMpp, ModelWithHooks, zo_normalizer, oz_normalizer
+from .original_class_activation_maps import originalCAM, originalGradCAM, originalGradCAMpp, originalModelWithHooks, originaldefault_normalizer
 from .gradient_based import GuidedBackpropGrad, GuidedBackpropSmoothGrad, SmoothGrad, VanillaGrad
 from .img2tensorboard import add_animated_gif, make_animated_gif_summary, plot_2d_or_3d_image
 from .occlusion_sensitivity import OcclusionSensitivity
