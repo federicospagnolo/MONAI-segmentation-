@@ -8,12 +8,10 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-
-from __future__ import annotations
+# edited by Federico Spagnolo
 
 import warnings
-from collections.abc import Callable, Sequence
-from typing import cast
+from typing import Callable, Dict, Sequence, Union
 
 import numpy as np
 import torch
@@ -25,10 +23,28 @@ from monai.transforms import ScaleIntensity
 from monai.utils import ensure_tuple, pytorch_after
 from monai.visualize.visualizer import default_upsampler
 
-__all__ = ["CAM", "GradCAM", "GradCAMpp", "ModelWithHooks", "default_normalizer"]
+__all__ = ["CAM", "GradCAM", "GradCAMpp", "ModelWithHooks", "zo_normalizer", "oz_normalizer"]
 
 
-def default_normalizer(x: NdarrayTensor) -> NdarrayTensor:
+def zo_normalizer(x: NdarrayTensor) -> NdarrayTensor:
+    """
+    A linear intensity scaling by mapping the (min, max) to (0, 1).
+    If the input data is PyTorch Tensor, the output data will be Tensor on the same device,
+    otherwise, output data will be numpy array.
+
+    Note: This will flip magnitudes (i.e., smallest will become biggest and vice versa).
+    """
+
+    def _compute(data: np.ndarray) -> np.ndarray:
+        scaler = ScaleIntensity(minv=0.0, maxv=1.0)
+        return np.stack([scaler(i) for i in data], axis=0)
+
+    if isinstance(x, torch.Tensor):
+        return torch.as_tensor(_compute(x.detach().cpu().numpy()), device=x.device)  # type: ignore
+
+    return _compute(x)  # type: ignore
+    
+def oz_normalizer(x: NdarrayTensor) -> NdarrayTensor:
     """
     A linear intensity scaling by mapping the (min, max) to (1, 0).
     If the input data is PyTorch Tensor, the output data will be Tensor on the same device,
@@ -44,7 +60,7 @@ def default_normalizer(x: NdarrayTensor) -> NdarrayTensor:
     if isinstance(x, torch.Tensor):
         return torch.as_tensor(_compute(x.detach().cpu().numpy()), device=x.device)  # type: ignore
 
-    return _compute(x)  # type: ignore
+    return _compute(x)  # type: ignore    
 
 
 class ModelWithHooks:
@@ -54,8 +70,8 @@ class ModelWithHooks:
 
     def __init__(
         self,
-        nn_module: nn.Module,
-        target_layer_names: str | Sequence[str],
+        nn_module,
+        target_layer_names: Union[str, Sequence[str]],
         register_forward: bool = False,
         register_backward: bool = False,
     ):
@@ -69,11 +85,11 @@ class ModelWithHooks:
         """
         self.model = nn_module
         self.target_layers = ensure_tuple(target_layer_names)
-
-        self.gradients: dict[str, torch.Tensor] = {}
-        self.activations: dict[str, torch.Tensor] = {}
-        self.score: torch.Tensor | None = None
-        self.class_idx: int | None = None
+        
+        self.gradients: Dict[str, torch.Tensor] = {}
+        self.activations: Dict[str, torch.Tensor] = {}
+        self.score = None
+        self.class_idx = None
         self.register_backward = register_backward
         self.register_forward = register_forward
 
@@ -107,7 +123,7 @@ class ModelWithHooks:
 
         return _hook
 
-    def get_layer(self, layer_id: str | Callable[[nn.Module], nn.Module]) -> nn.Module:
+    def get_layer(self, layer_id: Union[str, Callable]):
         """
 
         Args:
@@ -122,30 +138,32 @@ class ModelWithHooks:
         if isinstance(layer_id, str):
             for name, mod in self.model.named_modules():
                 if name == layer_id:
-                    return cast(nn.Module, mod)
+                    return mod
         raise NotImplementedError(f"Could not find {layer_id}.")
 
-    def class_score(self, logits: torch.Tensor, class_idx: int) -> torch.Tensor:
+    def class_score(self, logits, class_idx):
         return logits[:, class_idx].squeeze()
 
-    def __call__(self, x, class_idx=None, retain_graph=False, **kwargs):
+    def __call__(self, x, class_idx=None, footprint=None, retain_graph=False):
         train = self.model.training
         self.model.eval()
-        logits = self.model(x, **kwargs)
+        logits = self.model(x)
         self.class_idx = logits.max(1)[-1] if class_idx is None else class_idx
         acti, grad = None, None
         if self.register_forward:
             acti = tuple(self.activations[layer] for layer in self.target_layers)
         if self.register_backward:
-            self.score = self.class_score(logits, cast(int, self.class_idx))
+            self.score = self.class_score(logits, self.class_idx) #torch.Size([192, 256, 256])
+            #print(logits.shape, self.score.shape)
             self.model.zero_grad()
-            self.score.sum().backward(retain_graph=retain_graph)
+            self.score[footprint].sum().backward(retain_graph=True)
             for layer in self.target_layers:
                 if layer not in self.gradients:
                     warnings.warn(
                         f"Backward hook for {layer} is not triggered; `requires_grad` of {layer} should be `True`."
-                    )
+                    )        
             grad = tuple(self.gradients[layer] for layer in self.target_layers if layer in self.gradients)
+            #grad = tuple(torch.autograd.grad(self.score[70:80,80:90,160:175].sum(), self.activations[layer], create_graph=True, retain_graph=True)[0] for layer in self.target_layers if layer in self.gradients)
         if train:
             self.model.train()
         return logits, acti, grad
@@ -158,16 +176,16 @@ class CAMBase:
     """
     Base class for CAM methods.
     """
-
     def __init__(
         self,
         nn_module: nn.Module,
         target_layers: str,
         upsampler: Callable = default_upsampler,
-        postprocessing: Callable = default_normalizer,
+        postprocessing: Callable = zo_normalizer,
+        upsampler2: Callable = default_upsampler,
+        postprocessing2: Callable = oz_normalizer,
         register_backward: bool = True,
     ) -> None:
-        self.nn_module: ModelWithHooks
         # Convert to model with hooks if necessary
         if not isinstance(nn_module, ModelWithHooks):
             self.nn_module = ModelWithHooks(
@@ -178,19 +196,20 @@ class CAMBase:
 
         self.upsampler = upsampler
         self.postprocessing = postprocessing
+        self.upsampler2 = upsampler2
+        self.postprocessing2 = postprocessing2
 
-    def feature_map_size(self, input_size, device="cpu", layer_idx=-1, **kwargs):
+    def feature_map_size(self, input_size, device="cpu", layer_idx=-1):
         """
         Computes the actual feature map size given `nn_module` and the target_layer name.
         Args:
             input_size: shape of the input tensor
             device: the device used to initialise the input tensor
             layer_idx: index of the target layer if there are multiple target layers. Defaults to -1.
-            kwargs: any extra arguments to be passed on to the module as part of its `__call__`.
         Returns:
             shape of the actual feature map.
         """
-        return self.compute_map(torch.zeros(*input_size, device=device), layer_idx=layer_idx, **kwargs).shape
+        return self.compute_map(torch.zeros(*input_size, device=device), layer_idx=layer_idx).shape
 
     def compute_map(self, x, class_idx=None, layer_idx=-1):
         """
@@ -208,9 +227,21 @@ class CAMBase:
 
     def _upsample_and_post_process(self, acti_map, x):
         # upsampling and postprocessing
-        img_spatial = x.shape[2:]
-        acti_map = self.upsampler(img_spatial)(acti_map)
-        return self.postprocessing(acti_map)
+        if self.upsampler:
+            img_spatial = x.shape[2:]
+            acti_map = self.upsampler(img_spatial)(acti_map)
+        if self.postprocessing:
+            acti_map = self.postprocessing(acti_map)
+        return acti_map
+    
+    def _upsample_and_post_process2(self, acti_map, x):
+        # upsampling and postprocessing
+        if self.upsampler2:
+            img_spatial = x.shape[2:]
+            acti_map = self.upsampler2(img_spatial)(acti_map)
+        if self.postprocessing2:
+            acti_map = self.postprocessing2(acti_map)
+        return acti_map    
 
     def __call__(self):
         raise NotImplementedError()
@@ -239,10 +270,10 @@ class CAM(CAMBase):
         result = cam(x=torch.rand((1, 1, 48, 64)))
 
         # resnet 2d
-        from monai.networks.nets import seresnet50
+        from monai.networks.nets import se_resnet50
         from monai.visualize import CAM
 
-        model_2d = seresnet50(spatial_dims=2, in_channels=3, num_classes=4)
+        model_2d = se_resnet50(spatial_dims=2, in_channels=3, num_classes=4)
         cam = CAM(nn_module=model_2d, target_layers="layer4", fc_layers="last_linear")
         result = cam(x=torch.rand((2, 3, 48, 64)))
 
@@ -262,9 +293,11 @@ class CAM(CAMBase):
         self,
         nn_module: nn.Module,
         target_layers: str,
-        fc_layers: str | Callable = "fc",
+        fc_layers: Union[str, Callable] = "fc",
         upsampler: Callable = default_upsampler,
-        postprocessing: Callable = default_normalizer,
+        upsampler2: Callable = default_upsampler,
+        postprocessing: Callable = zo_normalizer,
+        postprocessing2: Callable = oz_normalizer,
     ) -> None:
         """
         Args:
@@ -288,8 +321,8 @@ class CAM(CAMBase):
         )
         self.fc_layers = fc_layers
 
-    def compute_map(self, x, class_idx=None, layer_idx=-1, **kwargs):
-        logits, acti, _ = self.nn_module(x, **kwargs)
+    def compute_map(self, x, class_idx=None, layer_idx=-1):
+        logits, acti, _ = self.nn_module(x)
         acti = acti[layer_idx]
         if class_idx is None:
             class_idx = logits.max(1)[-1]
@@ -300,7 +333,7 @@ class CAM(CAMBase):
         output = torch.stack([output[i, b : b + 1] for i, b in enumerate(class_idx)], dim=0)
         return output.reshape(b, 1, *spatial)  # resume the spatial dims on the selected class
 
-    def __call__(self, x, class_idx=None, layer_idx=-1, **kwargs):
+    def __call__(self, x, class_idx=None, layer_idx=-1):
         """
         Compute the activation map with upsampling and postprocessing.
 
@@ -308,12 +341,11 @@ class CAM(CAMBase):
             x: input tensor, shape must be compatible with `nn_module`.
             class_idx: index of the class to be visualized. Default to argmax(logits)
             layer_idx: index of the target layer if there are multiple target layers. Defaults to -1.
-            kwargs: any extra arguments to be passed on to the module as part of its `__call__`.
 
         Returns:
             activation maps
         """
-        acti_map = self.compute_map(x, class_idx, layer_idx, **kwargs)
+        acti_map = self.compute_map(x, class_idx, layer_idx)
         return self._upsample_and_post_process(acti_map, x)
 
 
@@ -340,10 +372,10 @@ class GradCAM(CAMBase):
         result = cam(x=torch.rand((1, 1, 48, 64)))
 
         # resnet 2d
-        from monai.networks.nets import seresnet50
+        from monai.networks.nets import se_resnet50
         from monai.visualize import GradCAM
 
-        model_2d = seresnet50(spatial_dims=2, in_channels=3, num_classes=4)
+        model_2d = se_resnet50(spatial_dims=2, in_channels=3, num_classes=4)
         cam = GradCAM(nn_module=model_2d, target_layers="layer4")
         result = cam(x=torch.rand((2, 3, 48, 64)))
 
@@ -359,15 +391,15 @@ class GradCAM(CAMBase):
 
     """
 
-    def compute_map(self, x, class_idx=None, retain_graph=False, layer_idx=-1, **kwargs):
-        _, acti, grad = self.nn_module(x, class_idx=class_idx, retain_graph=retain_graph, **kwargs)
+    def compute_map(self, x, class_idx=None, retain_graph=False, layer_idx=-1):
+        _, acti, grad = self.nn_module(x, class_idx=class_idx, retain_graph=retain_graph)
         acti, grad = acti[layer_idx], grad[layer_idx]
         b, c, *spatial = grad.shape
-        weights = grad.view(b, c, -1).mean(2).view(b, c, *[1] * len(spatial))
+        weights = grad.view(b, c, -1).mean(2).view(b, c, *[1] * len(spatial)) #mean of grads w.r.t a feature map torch.Size([1, 2, 1, 1, 1])
         acti_map = (weights * acti).sum(1, keepdim=True)
         return F.relu(acti_map)
 
-    def __call__(self, x, class_idx=None, layer_idx=-1, retain_graph=False, **kwargs):
+    def __call__(self, x, class_idx=None, layer_idx=-1, footprint=None, retain_graph=False):
         """
         Compute the activation map with upsampling and postprocessing.
 
@@ -376,12 +408,11 @@ class GradCAM(CAMBase):
             class_idx: index of the class to be visualized. Default to argmax(logits)
             layer_idx: index of the target layer if there are multiple target layers. Defaults to -1.
             retain_graph: whether to retain_graph for torch module backward call.
-            kwargs: any extra arguments to be passed on to the module as part of its `__call__`.
 
         Returns:
             activation maps
         """
-        acti_map = self.compute_map(x, class_idx=class_idx, retain_graph=retain_graph, layer_idx=layer_idx, **kwargs)
+        acti_map = self.compute_map(x, class_idx=class_idx, footprint=footprint, retain_graph=retain_graph, layer_idx=layer_idx)
         return self._upsample_and_post_process(acti_map, x)
 
 
@@ -399,15 +430,18 @@ class GradCAMpp(GradCAM):
 
     """
 
-    def compute_map(self, x, class_idx=None, retain_graph=False, layer_idx=-1, **kwargs):
-        _, acti, grad = self.nn_module(x, class_idx=class_idx, retain_graph=retain_graph, **kwargs)
-        acti, grad = acti[layer_idx], grad[layer_idx]
+    def compute_map(self, x, class_idx=None, footprint=None, retain_graph=False, layer_idx=-1):
+        _, acti, grad = self.nn_module(x, class_idx=class_idx, footprint=footprint, retain_graph=True)
+        acti, grad = acti[layer_idx][:,1].unsqueeze(1), grad[layer_idx][:,1].unsqueeze(1)
         b, c, *spatial = grad.shape
         alpha_nr = grad.pow(2)
         alpha_dr = alpha_nr.mul(2) + acti.mul(grad.pow(3)).view(b, c, -1).sum(-1).view(b, c, *[1] * len(spatial))
         alpha_dr = torch.where(alpha_dr != 0.0, alpha_dr, torch.ones_like(alpha_dr))
         alpha = alpha_nr.div(alpha_dr + 1e-7)
-        relu_grad = F.relu(cast(torch.Tensor, self.nn_module.score).exp() * grad)
-        weights = (alpha * relu_grad).view(b, c, -1).sum(-1).view(b, c, *[1] * len(spatial))
-        acti_map = (weights * acti).sum(1, keepdim=True)
-        return F.relu(acti_map)
+        #relu_grad = F.relu(self._upsample_and_post_process(self.nn_module.score.unsqueeze(0).unsqueeze(0).exp(), grad) * grad)
+        relu_grad = F.relu(grad)
+        #relu_grad = F.relu(self.nn_module.score.exp() * grad)
+        weights = alpha * relu_grad
+        #weights = (alpha * relu_grad).view(b, c, -1).sum(-1).view(b, c, *[1] * len(spatial))
+        acti_map = F.relu((weights * acti).sum(1, keepdim=True))
+        return self._upsample_and_post_process(acti_map, x)
